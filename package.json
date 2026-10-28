@@ -1,0 +1,31 @@
+{
+  "name": "@ericx057/helium-cli",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "A small Rust command line companion for Helium on macOS",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ericx057/helium-cli.git"
+  },
+  "bin": {
+    "hel": "bin/hel.cjs"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.cjs",
+    "delete": "node scripts/delete.cjs",
+    "smoke": "node scripts/smoke.cjs",
+    "test": "node --test scripts/install.test.cjs"
+  },
+  "files": [
+    "bin/hel.cjs",
+    "scripts",
+    "src",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "os": ["darwin"],
+  "engines": {
+    "node": ">=18"
+  }
+}
