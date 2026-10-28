@@ -8,7 +8,7 @@
     "url": "git+https://github.com/ericx057/helium-cli.git"
   },
   "bin": {
-    "hel": "bin/hel.cjs"
+    "hel": "bin/hel"
   },
   "scripts": {
     "postinstall": "node scripts/install.cjs",
@@ -17,8 +17,10 @@
     "test": "node --test scripts/install.test.cjs"
   },
   "files": [
-    "bin/hel.cjs",
+    "bin/hel",
     "scripts",
+    "benches",
+    "docs/performance.md",
     "src",
     "Cargo.toml",
     "Cargo.lock",

@@ -1,5 +1,5 @@
 use crate::search::Tab;
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::process::{Command, Output};
 
 pub struct Browser;
@@ -10,6 +10,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Created {
     pub session: String,
     pub window_id: i64,
@@ -17,12 +18,14 @@ pub struct Created {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireSnapshot {
     session: String,
     tabs: Vec<WireTab>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireTab {
     window_id: i64,
     tab_id: i64,
@@ -30,9 +33,16 @@ struct WireTab {
     url: String,
 }
 
-fn parse_snapshot(value: serde_json::Value) -> Result<Snapshot, String> {
-    let wire: WireSnapshot = serde_json::from_value(value)
-        .map_err(|_| "Helium returned an invalid tab list".to_owned())?;
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+#[derive(Deserialize)]
+struct AutomationError {
+    error: String,
+}
+
+fn parse_snapshot(wire: WireSnapshot) -> Result<Snapshot, String> {
     if (!wire.tabs.is_empty() && wire.session.is_empty())
         || wire
             .tabs
@@ -56,7 +66,7 @@ fn parse_snapshot(value: serde_json::Value) -> Result<Snapshot, String> {
     })
 }
 
-fn decode_output(output: Output) -> Result<serde_json::Value, String> {
+fn decode_output<T: DeserializeOwned>(output: Output) -> Result<T, String> {
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(if detail.contains("-1743") {
@@ -67,16 +77,15 @@ fn decode_output(output: Output) -> Result<serde_json::Value, String> {
                 .to_owned()
         });
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "Helium returned invalid automation data".to_owned())?;
-    if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-        return Err(error.to_owned());
-    }
-    Ok(value)
+    serde_json::from_slice(&output.stdout).map_err(|_| {
+        serde_json::from_slice::<AutomationError>(&output.stdout)
+            .map(|error| error.error)
+            .unwrap_or_else(|_| "Helium returned invalid automation data".to_owned())
+    })
 }
 
 impl Browser {
-    fn call(&self, action: &str, arguments: &[&str]) -> Result<serde_json::Value, String> {
+    fn call<T: DeserializeOwned>(&self, action: &str, arguments: &[&str]) -> Result<T, String> {
         if !cfg!(target_os = "macos") {
             return Err("hel currently supports macOS only".to_owned());
         }
@@ -100,14 +109,13 @@ impl Browser {
     }
 
     pub fn create(&self, url: Option<&str>, window: bool) -> Result<Created, String> {
-        let created: Created = serde_json::from_value(self.call(
+        let created: Created = self.call(
             "create",
             &[
                 if window { "window" } else { "tab" },
                 url.unwrap_or("chrome://newtab/"),
             ],
-        )?)
-        .map_err(|_| "Helium returned invalid creation data".to_owned())?;
+        )?;
         if created.session.is_empty() || created.window_id <= 0 || created.tab_id <= 0 {
             return Err("Helium returned invalid creation identifiers".to_owned());
         }
@@ -115,7 +123,7 @@ impl Browser {
     }
 
     pub fn focus(&self, session: &str, window_id: i64, tab_id: i64) -> Result<(), String> {
-        self.call(
+        self.call::<Empty>(
             "focus",
             &[session, &window_id.to_string(), &tab_id.to_string()],
         )?;
@@ -123,7 +131,7 @@ impl Browser {
     }
 
     pub fn close_tab(&self, session: &str, window_id: i64, tab_id: i64) -> Result<(), String> {
-        self.call(
+        self.call::<Empty>(
             "close-tab",
             &[session, &window_id.to_string(), &tab_id.to_string()],
         )?;
@@ -131,7 +139,7 @@ impl Browser {
     }
 
     pub fn close_window(&self, session: &str, window_id: i64) -> Result<(), String> {
-        self.call("close-window", &[session, &window_id.to_string()])?;
+        self.call::<Empty>("close-window", &[session, &window_id.to_string()])?;
         Ok(())
     }
 }
@@ -141,9 +149,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn snapshot(value: serde_json::Value) -> Result<Snapshot, String> {
+        let mut output = Command::new("/usr/bin/true").output().unwrap();
+        output.stdout = serde_json::to_vec(&value).unwrap();
+        parse_snapshot(decode_output(output)?)
+    }
+
     #[test]
     fn snapshot_preserves_special_characters() {
-        let snapshot = parse_snapshot(json!({
+        let snapshot = snapshot(json!({
             "session": "123:456", "tabs": [{
                 "window_id": 12, "tab_id": 34,
                 "title": "A\tB\nC 日本語 \"quoted\"", "url": "https://example.com/"
@@ -156,7 +170,7 @@ mod tests {
 
     #[test]
     fn stopped_browser_has_empty_snapshot() {
-        let snapshot = parse_snapshot(json!({"session": "", "tabs": []})).unwrap();
+        let snapshot = snapshot(json!({"session": "", "tabs": []})).unwrap();
         assert!(snapshot.tabs.is_empty());
     }
 
@@ -168,7 +182,7 @@ mod tests {
             json!({"session":"", "tabs":[{"window_id":1,"tab_id":2,"title":"x","url":"x"}]}),
             json!({"session":"a", "tabs":[{"window_id":-1,"tab_id":2,"title":"x","url":"x"}]}),
         ] {
-            assert!(parse_snapshot(value).is_err());
+            assert!(snapshot(value).is_err());
         }
     }
 
@@ -176,7 +190,7 @@ mod tests {
     fn script_failures_do_not_expose_output() {
         let mut output = Command::new("/usr/bin/false").output().unwrap();
         output.stderr = b"private search text".to_vec();
-        let error = decode_output(output).unwrap_err();
+        let error = decode_output::<Empty>(output).unwrap_err();
         assert!(!error.contains("private"));
     }
 
@@ -185,7 +199,7 @@ mod tests {
         let mut output = Command::new("/usr/bin/false").output().unwrap();
         output.stderr = b"Not authorized (-1743)".to_vec();
         assert!(
-            decode_output(output)
+            decode_output::<Empty>(output)
                 .unwrap_err()
                 .contains("Privacy & Security")
         );
@@ -196,8 +210,28 @@ mod tests {
         let mut output = Command::new("/usr/bin/true").output().unwrap();
         output.stdout = b"private title".to_vec();
         assert_eq!(
-            decode_output(output).unwrap_err(),
+            decode_output::<Empty>(output).unwrap_err(),
             "Helium returned invalid automation data"
+        );
+    }
+
+    #[test]
+    fn mutation_error_envelope_is_not_mistaken_for_success() {
+        let mut output = Command::new("/usr/bin/true").output().unwrap();
+        output.stdout = br#"{"error":"That tab is no longer open"}"#.to_vec();
+        assert_eq!(
+            decode_output::<Empty>(output).unwrap_err(),
+            "That tab is no longer open"
+        );
+    }
+
+    #[test]
+    fn escaped_automation_errors_are_preserved() {
+        let mut output = Command::new("/usr/bin/true").output().unwrap();
+        output.stdout = br#"{"error":"Could not select \"tab\""}"#.to_vec();
+        assert_eq!(
+            decode_output::<Empty>(output).unwrap_err(),
+            "Could not select \"tab\""
         );
     }
 }

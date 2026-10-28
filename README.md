@@ -6,7 +6,7 @@ Built for the moment when you are too lazy to Alt-Tab to search something up, bu
 
 ## Install
 
-Requires macOS, [Helium](https://helium.computer/) in `/Applications/Helium.app`, Node.js 18 or newer with npm, and [Rust](https://rustup.rs/) 1.89 or newer with Cargo. Rust compiles the CLI during installation; npm supplies the command wrapper.
+Requires macOS, [Helium](https://helium.computer/) in `/Applications/Helium.app`, Node.js 18 or newer with npm, and [Rust](https://rustup.rs/) 1.89 or newer with Cargo. Rust compiles the CLI during installation. A small shell launcher runs the native executable directly; Node.js is used only for installation and development scripts.
 
 From GitHub:
 
@@ -63,16 +63,18 @@ Tab numbers stay consistent when you focus another window. Opening or closing ta
 
 ```mermaid
 flowchart LR
-    Terminal[Terminal: hel] --> Wrapper[Small npm wrapper]
+    Terminal[Terminal: hel] --> Wrapper[Shell launcher: exec]
     Wrapper --> Rust[Rust CLI]
     Rust --> Automation[macOS automation]
     Automation <--> Helium[Helium windows and tabs]
     Rust <--> History[Local tab numbers and creation history]
-    Rust --> Index[Character suffix trie]
+    Rust --> Index[Compact character and sequence index]
     Index --> Results[Title and site matches]
 ```
 
-Each title is indexed from every character using a suffix trie, storing up to eight characters per starting position. A title query walks one branch, then checks the full query against candidate titles. This bounds index construction to linear space and a fixed number of tree insertions per title character, including for long titles. Many titles sharing the same first eight query characters require more candidate checks. The index is built only when a title search needs it, using live tabs on each invocation, so changed titles and closed tabs do not leave stale results. Site matching checks hostnames separately without building the title tree; combined search intersects the results.
+Title lookup indexes letters and short character sequences in sorted arrays, using binary search and compact tab bitsets. A Bloom filter rejects many absent sequences; every candidate is checked against the full query. The index borrows live titles and caps its own storage at 8 KiB. It reduces sequence depth, then falls back to a scan if a large character set cannot fit. Unicode titles retain case-insensitive substring matching. Site searches read hostnames directly, and combined searches filter by site before checking titles.
+
+The 8 KiB cap covers the persistent index object and its requested heap storage. Input tabs, result vectors, allocator metadata, and temporary Unicode/query normalization are separate. The requested 5 ns p95 lookup target has **not** been reached. See [measurements and tradeoffs](docs/performance.md).
 
 Automation addresses tabs and windows by their browser IDs. Saved state contains those IDs and local numbering/history, rather than a copy of your browsing titles or URLs. Closing a tracked window also closes its tabs, including any you added manually after `hel open`.
 
@@ -82,6 +84,7 @@ Automation addresses tabs and windows by their browser IDs. Saved state contains
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
 npm test
+cargo bench --bench search --locked
 ```
 
 After `cargo build --release --locked`, run `npm run smoke` for a live browser check. It opens a temporary window, tests the commands, and closes that window while checking that your original tabs remain open.

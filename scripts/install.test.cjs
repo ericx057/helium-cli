@@ -5,8 +5,20 @@ const path = require('node:path');
 const childProcess = require('node:child_process');
 const { test } = require('node:test');
 const { resolveCargo, build, install } = require('./install.cjs');
-const { launch } = require('../bin/hel.cjs');
 const { uninstall } = require('./delete.cjs');
+
+function launcherFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hel launcher test '));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const directory = path.join(root, 'package with spaces', 'bin');
+  fs.mkdirSync(directory, { recursive: true });
+  const launcher = path.join(directory, 'hel');
+  fs.copyFileSync(path.resolve(__dirname, '../bin/hel'), launcher);
+  fs.chmodSync(launcher, 0o755);
+  const native = path.join(directory, 'hel-native');
+  fs.writeFileSync(native, '#!/bin/sh\nprintf \'%s\\0\' "$@"\nexit 7\n', { mode: 0o755 });
+  return { root, launcher, native };
+}
 
 test('finds an executable cargo on PATH or in the standard Rust directory', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hel-install-test-'));
@@ -68,24 +80,41 @@ test('successful installation copies and marks the native binary executable', (t
   assert.deepEqual(modes, [[path.join(root, 'bin', 'hel-native'), 0o755]]);
 });
 
-test('wrapper forwards arguments literally and propagates native status', (t) => {
-  const calls = [];
-  t.mock.method(childProcess, 'spawnSync', (...args) => {
-    calls.push(args);
-    return { status: 7 };
-  });
-  assert.equal(launch(['tab', 'quotes " and $(touch /tmp/no)']), 7);
-  assert.equal(calls[0][0], path.resolve(__dirname, '../bin/hel-native'));
-  assert.deepEqual(calls[0][1], ['tab', 'quotes " and $(touch /tmp/no)']);
-  assert.deepEqual(calls[0][2], { stdio: 'inherit' });
+test('shell launcher forwards arguments literally and propagates native status', (t) => {
+  const { root, launcher } = launcherFixture(t);
+  const marker = path.join(root, 'must-not-exist');
+  const args = ['tab', `quotes " and $(touch "${marker}")`, '', '*.txt', '東京'];
+  const result = childProcess.spawnSync(launcher, args, { encoding: 'utf8' });
+  assert.equal(result.status, 7);
+  assert.equal(result.stdout, `${args.join('\0')}\0`);
+  assert.equal(fs.existsSync(marker), false);
 });
 
-test('wrapper reports a missing native executable', (t) => {
-  t.mock.method(childProcess, 'spawnSync', () => ({ error: new Error('ENOENT') }));
-  const errors = [];
-  t.mock.method(console, 'error', (message) => errors.push(message));
-  assert.equal(launch([]), 1);
-  assert.match(errors[0], /npm rebuild/);
+test('launcher resolves absolute and relative symlinks through paths with spaces', (t) => {
+  const { root, launcher } = launcherFixture(t);
+  const links = path.join(root, 'links with spaces');
+  fs.mkdirSync(links);
+  const absolute = path.join(links, 'absolute');
+  const relative = path.join(links, 'relative');
+  const chain = path.join(links, 'chain');
+  fs.symlinkSync(launcher, absolute);
+  fs.symlinkSync(path.relative(links, launcher), relative);
+  fs.symlinkSync('relative', chain);
+  for (const command of [absolute, relative, chain, './chain']) {
+    const result = childProcess.spawnSync(command, ['literal title'], {
+      encoding: 'utf8', cwd: links,
+    });
+    assert.equal(result.status, 7, result.stderr);
+    assert.equal(result.stdout, 'literal title\0');
+  }
+});
+
+test('launcher reports a missing native executable with status 127', (t) => {
+  const { launcher, native } = launcherFixture(t);
+  fs.unlinkSync(native);
+  const result = childProcess.spawnSync(launcher, [], { encoding: 'utf8' });
+  assert.equal(result.status, 127);
+  assert.match(result.stderr, /npm rebuild --global @ericx057\/helium-cli/);
 });
 
 test('delete invokes only the global package uninstall without a shell', (t) => {

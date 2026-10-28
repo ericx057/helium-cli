@@ -1,0 +1,19 @@
+#!/bin/sh
+launcher=$0
+while :; do
+    directory=${launcher%/*}
+    [ "$directory" != "$launcher" ] || directory=.
+    [ -n "$directory" ] || directory=/
+    [ -L "$launcher" ] || break
+    target=$(/usr/bin/readlink "$launcher") || exit 127
+    case $target in
+        /*) launcher=$target ;;
+        *) launcher=$directory/$target ;;
+    esac
+done
+native=$directory/hel-native
+if [ ! -x "$native" ]; then
+    printf '%s\n' 'hel: native executable missing; run npm rebuild --global @ericx057/helium-cli.' >&2
+    exit 127
+fi
+exec "$native" "$@"

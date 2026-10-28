@@ -50,37 +50,37 @@ pub fn run(
     if command == Command::Help {
         return Ok(HELP.into());
     }
+    if matches!(&command, Command::New | Command::Open | Command::Search(_)) {
+        let url = match &command {
+            Command::Search(query) => Some(search_url(query)),
+            _ => None,
+        };
+        let window = command == Command::Open;
+        let created = browser.create(url.as_deref(), window)?;
+        if state.session != created.session {
+            state.sync(&created.session, &[]);
+        }
+        let key = TabKey {
+            window_id: created.window_id,
+            tab_id: created.tab_id,
+        };
+        state.opened_tabs.push(key);
+        if !state.order.contains(&key) {
+            state.order.push(key);
+        }
+        if window {
+            state.opened_windows.push(created.window_id);
+        }
+        return Ok(if window {
+            "Opened window."
+        } else {
+            "Opened tab."
+        }
+        .into());
+    }
     let snapshot = browser.snapshot()?;
     let tabs = state.sync(&snapshot.session, &snapshot.tabs);
     match command {
-        Command::New | Command::Open | Command::Search(_) => {
-            let url = match &command {
-                Command::Search(query) => Some(search_url(query)),
-                _ => None,
-            };
-            let window = command == Command::Open;
-            let created = browser.create(url.as_deref(), window)?;
-            if state.session != created.session {
-                state.sync(&created.session, &[]);
-            }
-            let key = TabKey {
-                window_id: created.window_id,
-                tab_id: created.tab_id,
-            };
-            state.opened_tabs.push(key);
-            if !state.order.contains(&key) {
-                state.order.push(key);
-            }
-            if window {
-                state.opened_windows.push(created.window_id);
-            }
-            Ok(if window {
-                "Opened window."
-            } else {
-                "Opened tab."
-            }
-            .into())
-        }
         Command::Close => {
             let key = *state
                 .opened_tabs
@@ -127,7 +127,7 @@ pub fn run(
         Command::SiteTitle(site, title) => {
             results(&tabs, &Index::new(&tabs).site_title(&site, &title))
         }
-        Command::Help => unreachable!(),
+        Command::Help | Command::New | Command::Open | Command::Search(_) => unreachable!(),
     }
 }
 
@@ -157,41 +157,50 @@ fn render(tabs: &[Tab], matches: &[usize]) -> String {
 }
 
 fn printable(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn search_url(query: &str) -> String {
-    let encoded: String = query
+    const PREFIX: &str = "https://duckduckgo.com/?q=";
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let unreserved = |byte: u8| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte);
+    let length: usize = query
         .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect();
-    format!("https://duckduckgo.com/?q={encoded}")
+        .map(|byte| if unreserved(byte) { 1 } else { 3 })
+        .sum();
+    let mut url = String::with_capacity(PREFIX.len() + length);
+    url.push_str(PREFIX);
+    for byte in query.bytes() {
+        if unreserved(byte) {
+            url.push(byte as char);
+        } else {
+            url.push('%');
+            url.push(HEX[(byte >> 4) as usize] as char);
+            url.push(HEX[(byte & 15) as usize] as char);
+        }
+    }
+    url
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     struct Fake {
         events: RefCell<Vec<String>>,
         session: &'static str,
         fail: bool,
+        snapshots: Cell<usize>,
+        fail_snapshot: bool,
     }
     fn tabs() -> Vec<Tab> {
         [
@@ -214,6 +223,8 @@ mod tests {
                 events: RefCell::new(vec![]),
                 session: "live",
                 fail: false,
+                snapshots: Cell::new(0),
+                fail_snapshot: false,
             }
         }
         fn event(&self, session: &str, event: String) -> Result<(), String> {
@@ -227,6 +238,10 @@ mod tests {
     }
     impl BrowserApi for Fake {
         fn snapshot(&self) -> Result<Snapshot, String> {
+            self.snapshots.set(self.snapshots.get() + 1);
+            if self.fail_snapshot {
+                return Err("snapshot failure".into());
+            }
             Ok(Snapshot {
                 session: self.session.into(),
                 tabs: tabs(),
@@ -271,6 +286,53 @@ mod tests {
             }]
         );
         assert!(state.opened_windows.is_empty());
+    }
+
+    #[test]
+    fn creating_tabs_never_reads_unrelated_tabs() {
+        let mut fake = Fake::new();
+        fake.fail_snapshot = true;
+        for command in [Command::New, Command::Open, Command::Search("Rust".into())] {
+            let mut state = State::default();
+            run(command, &fake, &mut state).unwrap();
+            assert_eq!(state.opened_tabs.len(), 1);
+        }
+        assert_eq!(fake.snapshots.get(), 0);
+        assert!(run(Command::List, &fake, &mut State::default()).is_err());
+        assert_eq!(fake.snapshots.get(), 1);
+    }
+
+    #[test]
+    fn creation_preserves_same_session_history_and_resets_restarted_sessions() {
+        let mut fake = Fake::new();
+        let key = TabKey::from(&tabs()[0]);
+        let mut state = State {
+            session: "live".into(),
+            order: vec![key],
+            opened_tabs: vec![key],
+            opened_windows: vec![key.window_id],
+        };
+        run(Command::New, &fake, &mut state).unwrap();
+        assert_eq!(state.opened_tabs[0], key);
+        assert_eq!(state.opened_tabs.len(), 2);
+        assert_eq!(state.order[0], key);
+        assert_eq!(state.opened_windows, [key.window_id]);
+        fake.fail = true;
+        let before = serde_json::to_string(&state).unwrap();
+        assert!(run(Command::Open, &fake, &mut state).is_err());
+        assert_eq!(serde_json::to_string(&state).unwrap(), before);
+        fake.fail = false;
+        state.session = "old".into();
+        run(Command::New, &fake, &mut state).unwrap();
+        assert_eq!(
+            state.opened_tabs,
+            [TabKey {
+                window_id: 4,
+                tab_id: 14
+            }]
+        );
+        assert!(state.opened_windows.is_empty());
+        assert_eq!(fake.snapshots.get(), 0);
     }
 
     #[test]
